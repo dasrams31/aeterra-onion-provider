@@ -575,10 +575,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except (UnicodeDecodeError, ValueError):
             return {}
 
-    def check_csrf(self, form):
-        _sid, csrf = get_session(self)
+    def check_csrf(self, form, csrf):
         tok = (form.get("csrf_token") or [""])[0]
-        return bool(tok) and secrets.compare_digest(tok, csrf)
+        ok = bool(tok) and secrets.compare_digest(tok, csrf)
+        if not ok:
+            has_cookie = bool(self.headers.get("Cookie", ""))
+            print("CSRF reject: cookie_present=%s token_present=%s" % (has_cookie, bool(tok)))
+        return ok
+
+    def csrf_error_page(self):
+        return page("Session expired",
+            "<div class='card'><div class='err'>Your session expired or is invalid. "
+            "This can happen if cookies are blocked or the page was open a long time.</div>"
+            "<p><a class='btn' href='/'>Back to home and try again</a></p></div>")
 
     # -- routing
     def do_GET(self):
@@ -619,16 +628,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         m = re.fullmatch(r"/job/([A-Za-z0-9_-]+)/cancel", path)
         if m and TOKEN_RE.fullmatch(m.group(1)):
-            if not self.check_csrf(form):
-                self.send_html(403, page("Error", "<div class='err'>Invalid CSRF.</div>"))
+            if not self.check_csrf(form, csrf):
+                self.send_html(403, self.csrf_error_page())
                 return
             cancel_job(m.group(1))
             self.redirect("/job/" + m.group(1))
             return
         m = re.fullmatch(r"/job/([A-Za-z0-9_-]+)/delete", path)
         if m and TOKEN_RE.fullmatch(m.group(1)):
-            if not self.check_csrf(form):
-                self.send_html(403, page("Error", "<div class='err'>Invalid CSRF.</div>"))
+            if not self.check_csrf(form, csrf):
+                self.send_html(403, self.csrf_error_page())
                 return
             delete_job(m.group(1))
             self.redirect("/")
@@ -649,8 +658,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return dict(zip(keys, row))
 
     def handle_request(self, sid, csrf, form):
-        if not self.check_csrf(form):
-            self.send_html(403, page("Error", "<div class='err'>Invalid CSRF.</div>"))
+        if not self.check_csrf(form, csrf):
+            self.send_html(403, self.csrf_error_page())
             return
         filt = (form.get("prefix") or [""])[0].strip().lower()
         ip = client_ip(self)
@@ -670,9 +679,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_html(
                 429,
                 page("Queue full",
-                     "<div class='card'><div class='err'>Anda masih punya job aktif "
-                     "(antrean/berjalan). Tunggu selesai atau batalkan dulu, "
-                     "maksimal %d job aktif per IP.</div>"
+                     "<div class='card'><div class='err'>You still have an active job "
+                     "(queued/running). Wait for it to finish or cancel it first, "
+                     "max %d active jobs per IP.</div>"
                      "<p><a href='/'>Back</a></p></div>" % MAX_ACTIVE_PER_IP),
             )
             return
