@@ -16,16 +16,21 @@ import os
 import re
 import secrets
 import shutil
+import socket
 import sqlite3
 import subprocess
 import tarfile
 import threading
 import time
 import urllib.parse
+import zipfile
+
+import ed25519 as ed25519_lib
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 JOBS_DIR = os.path.join(BASE_DIR, "jobs")
+HOSTING_DIR = os.path.join(BASE_DIR, "hosting")
 DB_PATH = os.path.join(DATA_DIR, "provider.db")
 
 PORT = int(os.environ.get("PORT", "18093"))
@@ -34,13 +39,22 @@ MKP224O_BIN = os.environ.get(
 )
 KEYS_PER_SEC = int(os.environ.get("KEYS_PER_SEC", "20000000"))
 MAX_BODY = 16 * 1024
+MAX_UPLOAD = 10 * 1024 * 1024
 SESSION_TTL = 30 * 86400
 MAX_ACTIVE_PER_IP = 1
 MAX_JOBS_PER_IP_24H = 5
+MAX_HOSTING_PER_IP = 20
 
 FILTER_RE = re.compile(r"^[a-z2-7]{1,7}$")
 TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
+HOSTING_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{16}$")
 ONION_RE = re.compile(r"([a-z2-7]{56}\.onion)")
+
+# Dynamic hosting hidden services (managed block inside /etc/tor/torrc)
+TORRC_PATH = "/etc/tor/torrc"
+TOR_HSDIR_PREFIX = "/var/lib/tor/aeterra-host-"
+HOSTING_TORRC_BEGIN = "# Aeterra hosting projects BEGIN (managed by aeterra-provider, do not edit)"
+HOSTING_TORRC_END = "# Aeterra hosting projects END"
 
 # ---------------------------------------------------------------- db
 
@@ -74,6 +88,20 @@ def db():
                 """CREATE TABLE IF NOT EXISTS sessions(
                     sid TEXT PRIMARY KEY,
                     csrf TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                )"""
+            )
+            # kind: 'bruteforce' | 'instant' (added later; backfill for old DBs)
+            try:
+                _db.execute("ALTER TABLE jobs ADD COLUMN kind TEXT NOT NULL DEFAULT 'bruteforce'")
+            except sqlite3.OperationalError:
+                pass
+            _db.execute(
+                """CREATE TABLE IF NOT EXISTS hosting(
+                    token TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    onion TEXT NOT NULL,
+                    ip TEXT NOT NULL,
                     created_at INTEGER NOT NULL
                 )"""
             )
@@ -359,6 +387,284 @@ def delete_job(token):
     return True
 
 
+# ---------------------------------------------------------------- instant domains
+
+def create_instant_job(ip):
+    """Generate a fresh random v3 .onion domain immediately (no bruteforce).
+
+    Returns the job token. Keys are written in the same layout as
+    bruteforce jobs so download/delete flows work unchanged."""
+    kp = ed25519_lib.generate_keypair()
+    addr = kp["address"]
+    hostname = addr + ".onion"
+    token = secrets.token_urlsafe(32)
+    jdir = job_dir(token)
+    os.makedirs(jdir, exist_ok=True)
+    os.chmod(jdir, 0o700)
+    onion_dir = os.path.join(jdir, hostname)
+    os.makedirs(onion_dir, exist_ok=True)
+    with open(os.path.join(onion_dir, "hostname"), "wb") as f:
+        f.write(kp["hostname"])
+    with open(os.path.join(onion_dir, "hs_ed25519_secret_key"), "wb") as f:
+        f.write(kp["secret_key_file"])
+    with open(os.path.join(onion_dir, "hs_ed25519_public_key"), "wb") as f:
+        f.write(kp["public_key_file"])
+    build_tarball(jdir, onion_dir, "instant")
+    qexec(
+        "INSERT INTO jobs(token, filter, ip, status, created_at,"
+        " started_at, finished_at, hostname, elapsed, kind)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (token, "instant", ip, "done", now(), now(), now(), hostname, 0.0,
+         "instant"),
+    )
+    return token
+
+
+# ---------------------------------------------------------------- hosting
+
+_host_map = {}  # onion hostname -> hosting token
+_host_map_lock = threading.Lock()
+
+
+def hosting_pubdir(token):
+    return os.path.join(HOSTING_DIR, token, "public")
+
+
+def hosting_keysdir(token):
+    return os.path.join(HOSTING_DIR, token, "keys")
+
+
+def hosting_hsdir(token):
+    return TOR_HSDIR_PREFIX + token
+
+
+def refresh_host_map():
+    rows = qexec("SELECT onion, token FROM hosting").fetchall()
+    with _host_map_lock:
+        _host_map.clear()
+        for onion, token in rows:
+            _host_map[onion.lower()] = token
+
+
+def hosting_token_for_host(host):
+    host = (host or "").split(":")[0].strip().lower()
+    with _host_map_lock:
+        return _host_map.get(host)
+
+
+def safe_extract_zip(zip_bytes, dest):
+    """Extract a zip into dest. Guards against zip-slip, bombs, junk."""
+    count = 0
+    total = 0
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
+        for info in z.infolist():
+            count += 1
+            if count > 500:
+                raise ValueError("zip has too many files (max 500)")
+            if info.file_size > 5 * 1024 * 1024:
+                raise ValueError("a file inside the zip exceeds 5 MB")
+            total += info.file_size
+            if total > 50 * 1024 * 1024:
+                raise ValueError("uncompressed size exceeds 50 MB")
+            p = info.filename.replace("\\", "/").lstrip("/")
+            parts = [x for x in p.split("/") if x not in ("", ".", "..")]
+            if not parts:
+                continue
+            target = os.path.join(dest, *parts)
+            if not os.path.abspath(target).startswith(
+                    os.path.abspath(dest) + os.sep):
+                raise ValueError("unsafe path inside zip")
+            if info.is_dir():
+                os.makedirs(target, exist_ok=True)
+            else:
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with z.open(info) as src, open(target, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+    # unwrap a single top-level folder (common when zipping a project dir)
+    try:
+        entries = [e for e in os.listdir(dest) if not e.startswith(".")]
+    except OSError:
+        entries = []
+    if len(entries) == 1:
+        single = os.path.join(dest, entries[0])
+        if os.path.isdir(single):
+            for e in os.listdir(single):
+                shutil.move(os.path.join(single, e), os.path.join(dest, e))
+            os.rmdir(single)
+
+
+def _tor_reload():
+    """Reload the real tor daemon (tor@default; tor.service is a dummy).
+    Returns True if tor is active afterwards."""
+    # validate our own key material first: derive pubkey from the secret
+    # scalar of every deployed hosting key and compare with the public file.
+    # (tor --verify-config does NOT check key validity; a bad key kills tor.)
+    try:
+        rows = qexec("SELECT token FROM hosting").fetchall()
+        for (token,) in rows:
+            hsdir = hosting_hsdir(token)
+            skp = os.path.join(hsdir, "hs_ed25519_secret_key")
+            pkp = os.path.join(hsdir, "hs_ed25519_public_key")
+            if not (os.path.isfile(skp) and os.path.isfile(pkp)):
+                continue
+            with open(skp, "rb") as f:
+                sk = f.read()
+            with open(pkp, "rb") as f:
+                pk = f.read()
+            if len(sk) != 96 or len(pk) != 64:
+                print("hosting key size invalid for %s, skip reload" % token)
+                return False
+            a = int.from_bytes(sk[32:64], "little")
+            if ed25519_lib._encodepoint(
+                    ed25519_lib._scalarmult(ed25519_lib._G, a)) != pk[32:64]:
+                print("hosting key mismatch for %s, skip reload" % token)
+                return False
+    except Exception as e:  # noqa: BLE001 - never reload on validation error
+        print("hosting key validation error: %s" % e)
+        return False
+    r = subprocess.run(["systemctl", "reload", "tor@default"],
+                       capture_output=True, timeout=60)
+    if r.returncode != 0:
+        # reload on an inactive unit may fail; try a plain start
+        subprocess.run(["systemctl", "reset-failed", "tor@default"],
+                       capture_output=True, timeout=30)
+        r = subprocess.run(["systemctl", "start", "tor@default"],
+                           capture_output=True, timeout=120)
+    time.sleep(3)
+    r = subprocess.run(["systemctl", "is-active", "tor@default"],
+                       capture_output=True, timeout=15, text=True)
+    ok = r.stdout.strip() == "active"
+    if not ok:
+        print("tor@default not active after reload/start!")
+    return ok
+
+
+def sync_hosting_tor():
+    """Deploy key material for every hosting project and regenerate the
+    managed torrc block. Returns True if tor was reloaded."""
+    try:
+        rows = qexec("SELECT token FROM hosting").fetchall()
+    except Exception:
+        return False
+    tokens = sorted(t for (t,) in rows if HOSTING_TOKEN_RE.fullmatch(t))
+    # 1. key dirs under /var/lib/tor
+    try:
+        for token in tokens:
+            hsdir = hosting_hsdir(token)
+            os.makedirs(hsdir, exist_ok=True)
+            for name in ("hostname", "hs_ed25519_secret_key",
+                         "hs_ed25519_public_key"):
+                src = os.path.join(hosting_keysdir(token), name)
+                dst = os.path.join(hsdir, name)
+                if os.path.isfile(src):
+                    shutil.copyfile(src, dst)
+            os.chmod(hsdir, 0o700)
+            for name in ("hs_ed25519_secret_key", "hs_ed25519_public_key",
+                         "hostname"):
+                p = os.path.join(hsdir, name)
+                if os.path.isfile(p):
+                    os.chmod(p, 0o600)
+            try:
+                shutil.chown(hsdir, "debian-tor", "debian-tor")
+                for name in ("hostname", "hs_ed25519_secret_key",
+                             "hs_ed25519_public_key"):
+                    p = os.path.join(hsdir, name)
+                    if os.path.isfile(p):
+                        shutil.chown(p, "debian-tor", "debian-tor")
+            except (OSError, LookupError):
+                pass
+    except OSError:
+        return False
+    # 2. managed torrc block
+    lines = [HOSTING_TORRC_BEGIN]
+    for token in tokens:
+        lines.append("HiddenServiceDir %s/" % hosting_hsdir(token))
+        lines.append("HiddenServicePort 80 127.0.0.1:18093")
+    lines.append(HOSTING_TORRC_END)
+    block = "\n".join(lines) + "\n"
+    try:
+        with open(TORRC_PATH, "r", encoding="utf-8", errors="replace") as f:
+            torrc = f.read()
+    except OSError:
+        return False
+    if HOSTING_TORRC_BEGIN in torrc and HOSTING_TORRC_END in torrc:
+        start = torrc.index(HOSTING_TORRC_BEGIN)
+        end = torrc.index(HOSTING_TORRC_END) + len(HOSTING_TORRC_END)
+        new_torrc = torrc[:start] + block + torrc[end:]
+    else:
+        new_torrc = torrc.rstrip("\n") + "\n\n" + block
+    changed = new_torrc != torrc
+    if changed:
+        try:
+            with open(TORRC_PATH, "w", encoding="utf-8") as f:
+                f.write(new_torrc)
+        except OSError:
+            return False
+        v = subprocess.run(["tor", "--verify-config", "-f", TORRC_PATH],
+                           capture_output=True, timeout=30)
+        if v.returncode != 0:
+            print("tor config verify FAILED after hosting sync")
+            return False
+    # 3. reload tor so new/removed hidden services apply
+    if changed:
+        return _tor_reload()
+    return False
+
+
+def create_hosting_project(name, zip_bytes, ip):
+    # 12 random bytes -> exactly 16 urlsafe chars (no padding)
+    token = secrets.token_urlsafe(12)
+    while qone("SELECT 1 FROM hosting WHERE token=?", (token,)):
+        token = secrets.token_urlsafe(12)
+    kp = ed25519_lib.generate_keypair()
+    onion = kp["address"] + ".onion"
+    base = os.path.join(HOSTING_DIR, token)
+    pub = os.path.join(base, "public")
+    keys = os.path.join(base, "keys")
+    os.makedirs(pub, exist_ok=True)
+    os.makedirs(keys, exist_ok=True)
+    try:
+        safe_extract_zip(zip_bytes, pub)
+        with open(os.path.join(keys, "hostname"), "wb") as f:
+            f.write(kp["hostname"])
+        with open(os.path.join(keys, "hs_ed25519_secret_key"), "wb") as f:
+            f.write(kp["secret_key_file"])
+        with open(os.path.join(keys, "hs_ed25519_public_key"), "wb") as f:
+            f.write(kp["public_key_file"])
+        qexec(
+            "INSERT INTO hosting(token, name, onion, ip, created_at)"
+            " VALUES (?,?,?,?,?)",
+            (token, name, onion, ip, now()),
+        )
+    except Exception:
+        shutil.rmtree(base, ignore_errors=True)
+        raise
+    sync_hosting_tor()
+    refresh_host_map()
+    return token, onion
+
+
+def delete_hosting_project(token):
+    row = qone("SELECT token FROM hosting WHERE token=?", (token,))
+    if not row:
+        return False
+    qexec("DELETE FROM hosting WHERE token=?", (token,))
+    shutil.rmtree(os.path.join(HOSTING_DIR, token), ignore_errors=True)
+    shutil.rmtree(hosting_hsdir(token), ignore_errors=True)
+    sync_hosting_tor()
+    refresh_host_map()
+    return True
+
+
+def get_hosting(token):
+    row = qone("SELECT token, name, onion, created_at FROM hosting WHERE token=?",
+               (token,))
+    if not row:
+        return None
+    return {"token": row[0], "name": row[1], "onion": row[2],
+            "created_at": row[3]}
+
+
 # ---------------------------------------------------------------- html
 
 CSS = """
@@ -412,7 +718,7 @@ def page(title, body, refresh=None):
         + "<title>" + esc(title) + " - Aeterra .onion Provider</title>"
         "<style>" + CSS + "</style></head><body><div class='wrap'>"
         "<header class='top'><div class='brand'>Aeterra <span>.onion</span> Provider</div>"
-        "<div><a href='/'>Home</a></div></header>"
+        "<div><a href='/'>Domains</a> &nbsp;<a href='/hosting'>Hosting</a></div></header>"
         + body
         + "<footer>Aeterra .onion Provider &mdash; Tor v3 vanity address bruteforce service. "
         "Keep your job link safe: it is the only access to your keys.</footer>"
@@ -445,6 +751,15 @@ Tor hidden service.</p>
 <p class='hint'>No account needed. Every request gets a secret link &mdash;
 anyone holding that link can download your keys. Do not share it.</p>
 <div class='card'>
+<h2 style='margin-top:0'>Need a domain right now?</h2>
+<p class='hint'>Skip the wait: generate a random v3 .onion address instantly.
+No prefix, no bruteforce, keys ready to download immediately.</p>
+<form method='post' action='/instant'>
+<input type='hidden' name='csrf_token' value='{csrf}'>
+<button type='submit'>Generate instant domain</button>
+</form>
+</div>
+<div class='card'>
 <h2 style='margin-top:0'>Request a domain</h2>
 {err}
 <form method='post' action='/request'>
@@ -473,6 +788,7 @@ anyone holding that link can download your keys. Do not share it.</p>
 
 def job_page(sid, csrf, job):
     token, filt, status = job["token"], job["filter"], job["status"]
+    kind = job.get("kind") or "bruteforce"
     badge = "<span class='badge b-%s'>%s</span>" % (
         status, esc(STATUS_ID.get(status, status)))
     created = fmt_ts(job["created_at"])
@@ -481,16 +797,23 @@ def job_page(sid, csrf, job):
     elapsed = fmt_dur(job["elapsed"]) if job["elapsed"] else "-"
     if status in ("queued", "running") and job["started_at"]:
         elapsed = fmt_dur(time.time() - job["started_at"])
-    est = estimate_for_filter(filt)
+    if kind == "instant":
+        est = "instant (no bruteforce)"
+        flabel = "Type"
+        fval = "Instant domain"
+    else:
+        est = estimate_for_filter(filt)
+        flabel = "Prefix"
+        fval = filt
     kv = (
-        "<div class='kv'><span>Prefix</span><code>%s</code></div>"
+        "<div class='kv'><span>%s</span><code>%s</code></div>"
         "<div class='kv'><span>Status</span>%s</div>"
         "<div class='kv'><span>Bruteforce estimate</span><span>%s</span></div>"
         "<div class='kv'><span>Created</span><span>%s</span></div>"
         "<div class='kv'><span>Started</span><span>%s</span></div>"
         "<div class='kv'><span>Finished</span><span>%s</span></div>"
         "<div class='kv'><span>Processing time</span><span>%s</span></div>"
-    ) % (esc(filt), badge, esc(est), esc(created), esc(started),
+    ) % (flabel, esc(fval), badge, esc(est), esc(created), esc(started),
          esc(finished), esc(elapsed))
     extra = ""
     if status == "done" and job["hostname"]:
@@ -520,6 +843,111 @@ def job_page(sid, csrf, job):
         % (esc(token), esc(csrf)))
     body = "<h1>Your job</h1><div class='card'>%s%s</div>" % (kv, extra)
     return page("Job " + filt, body, refresh=(status in ("queued", "running")))
+
+
+def fmt_size(n):
+    if n < 1024:
+        return "%d B" % n
+    if n < 1024 * 1024:
+        return "%.1f KB" % (n / 1024.0)
+    return "%.1f MB" % (n / 1048576.0)
+
+
+def hosting_list_page(sid, csrf, error=None):
+    err = "<div class='err'>%s</div>" % esc(error) if error else ""
+    rows = qexec(
+        "SELECT token, name, onion, created_at FROM hosting ORDER BY created_at DESC"
+    ).fetchall()
+    if rows:
+        items = ""
+        for token, name, onion, created_at in rows:
+            items += ("<tr><td><a href='/hosting/%s'>%s</a></td>"
+                      "<td class='mono' style='font-size:12px'>%s</td>"
+                      "<td>%s</td></tr>"
+                      % (esc(token), esc(name), esc(onion), esc(fmt_ts(created_at))))
+        table = ("<table><tr><th>Project</th><th>Address</th><th>Created</th></tr>"
+                 + items + "</table>")
+    else:
+        table = "<p class='hint'>No websites hosted yet.</p>"
+    body = """
+<h1>Onion hosting</h1>
+<p>Upload a static website as a <span class='mono'>.zip</span> and Aeterra
+hosts it on its own <span class='mono'>.onion</span> address. Each project
+gets a fresh random v3 address, generated instantly.</p>
+<p class='hint'>Static files only (HTML/CSS/JS/images). Max 10 MB zip,
+500 files, 50 MB uncompressed.</p>
+<div class='card'>
+<h2 style='margin-top:0'>Host a new website</h2>
+{err}
+<form method='post' action='/hosting/create' enctype='multipart/form-data'>
+<input type='hidden' name='csrf_token' value='{csrf}'>
+<label for='pname'>Project name</label>
+<input type='text' id='pname' name='name' maxlength='60' required
+  placeholder='My site' autocomplete='off' style='letter-spacing:0;font-size:15px'>
+<label for='pzip'>Website .zip file</label>
+<input type='file' id='pzip' name='sitezip' accept='.zip,application/zip' required>
+<button type='submit'>Upload &amp; host</button>
+</form>
+</div>
+<h2>Hosted websites</h2>
+{table}
+""".format(err=err, csrf=esc(csrf), table=table)
+    return page("Hosting", body)
+
+
+def hosting_detail_page(sid, csrf, project):
+    token = project["token"]
+    pub = hosting_pubdir(token)
+    files = []
+    total = 0
+    for root, _dirs, names in os.walk(pub):
+        for n in names:
+            if n.startswith("."):
+                continue
+            fp = os.path.join(root, n)
+            rel = os.path.relpath(fp, pub)
+            try:
+                sz = os.path.getsize(fp)
+            except OSError:
+                sz = 0
+            total += sz
+            files.append((rel, sz))
+    files.sort()
+    if files:
+        rows = "".join(
+            "<tr><td class='mono' style='font-size:12px'>%s</td><td>%s</td></tr>"
+            % (esc(rel), esc(fmt_size(sz))) for rel, sz in files[:200])
+        ftable = ("<table><tr><th>File</th><th>Size</th></tr>%s</table>"
+                  "<p class='hint'>%d files, %s total.</p>"
+                  % (rows, len(files), fmt_size(total)))
+    else:
+        ftable = "<p class='hint'>No files yet.</p>"
+    has_index = os.path.isfile(os.path.join(pub, "index.html")) or \
+        os.path.isfile(os.path.join(pub, "index.htm"))
+    warn = "" if has_index else \
+        "<div class='err'>No <span class='mono'>index.html</span> at the zip root. " \
+        "Visitors will see a 404 until you add one.</div>"
+    body = """
+<h1>{name}</h1>
+<div class='card'>
+<div class='kv'><span>Address</span><code>{onion}</code></div>
+<div class='kv'><span>Created</span><span>{created}</span></div>
+<div class='kv'><span>Manage</span><span><a href='/hosting/{token}'>this page</a></span></div>
+</div>
+{warn}
+<p><a class='btn' href='http://{onion}/' target='_blank' rel='noopener'>Visit website</a></p>
+<p class='hint'>Open this address in Tor Browser. It can take a minute for a
+fresh hidden service to become reachable.</p>
+<h2>Files</h2>
+{ftable}
+<form method='post' action='/hosting/{token}/delete' style='margin-top:16px'>
+<input type='hidden' name='csrf_token' value='{csrf}'>
+<button type='submit' class='danger'>Delete project &amp; address permanently</button>
+</form>
+""".format(name=esc(project["name"]), onion=esc(project["onion"]),
+           created=esc(fmt_ts(project["created_at"])),
+           token=esc(token), csrf=esc(csrf), warn=warn, ftable=ftable)
+    return page(project["name"], body)
 
 
 # ---------------------------------------------------------------- http handler
@@ -589,14 +1017,127 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "This can happen if cookies are blocked or the page was open a long time.</div>"
             "<p><a class='btn' href='/'>Back to home and try again</a></p></div>")
 
+    # -- multipart (hosting upload)
+    def parse_multipart(self, max_size):
+        ctype = self.headers.get("Content-Type", "")
+        if "multipart/form-data" not in ctype:
+            return None
+        m = re.search(r"boundary=([^\s;]+)", ctype)
+        if not m:
+            return None
+        boundary = m.group(1).strip('"').encode("ascii", "ignore")
+        try:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+        except ValueError:
+            return None
+        if length <= 0 or length > max_size:
+            return None
+        raw = self.rfile.read(length)
+        if len(raw) != length:
+            return None
+        fields, files = {}, {}
+        for part in raw.split(b"--" + boundary):
+            if b"\r\n\r\n" not in part:
+                continue
+            head, body = part.split(b"\r\n\r\n", 1)
+            if body.endswith(b"\r\n"):
+                body = body[:-2]
+            disp = ""
+            for line in head.decode("latin1").split("\r\n"):
+                if line.lower().startswith("content-disposition:"):
+                    disp = line.split(":", 1)[1]
+            nm = re.search(r'name="([^"]*)"', disp)
+            fn = re.search(r'filename="([^"]*)"', disp)
+            if not nm:
+                continue
+            if fn and fn.group(1):
+                files[nm.group(1)] = {
+                    "filename": os.path.basename(fn.group(1))[:120],
+                    "data": body,
+                }
+            else:
+                fields[nm.group(1)] = body.decode("utf-8", "replace")
+        return fields, files
+
+    # -- static file serving for hosted projects
+    MIME = {
+        ".html": "text/html; charset=utf-8", ".htm": "text/html; charset=utf-8",
+        ".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8",
+        ".json": "application/json", ".txt": "text/plain; charset=utf-8",
+        ".xml": "application/xml", ".svg": "image/svg+xml",
+        ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".gif": "image/gif", ".webp": "image/webp", ".ico": "image/x-icon",
+        ".woff": "font/woff", ".woff2": "font/woff2", ".ttf": "font/ttf",
+        ".mp4": "video/mp4", ".webm": "video/webm", ".mp3": "audio/mpeg",
+        ".pdf": "application/pdf",
+    }
+
+    def serve_hosted(self, token):
+        pub = os.path.abspath(hosting_pubdir(token))
+        upath = urllib.parse.urlparse(self.path).path
+        rel = urllib.parse.unquote(upath).lstrip("/")
+        target = os.path.abspath(os.path.join(pub, rel))
+        if not target.startswith(pub + os.sep) and target != pub:
+            self.send_html(404, page("404", "<h1>Not found</h1>"))
+            return
+        if os.path.basename(target).startswith("."):
+            self.send_html(404, page("404", "<h1>Not found</h1>"))
+            return
+        if os.path.isdir(target):
+            for idx in ("index.html", "index.htm"):
+                cand = os.path.join(target, idx)
+                if os.path.isfile(cand):
+                    target = cand
+                    break
+            else:
+                self.send_html(404, page("404", "<h1>Not found</h1>"))
+                return
+        if not os.path.isfile(target):
+            self.send_html(404, page("404", "<h1>Not found</h1>"))
+            return
+        ext = os.path.splitext(target)[1].lower()
+        ctype = self.MIME.get(ext, "application/octet-stream")
+        try:
+            with open(target, "rb") as f:
+                data = f.read()
+        except OSError:
+            self.send_html(500, page("Error", "<div class='err'>Read failed.</div>"))
+            return
+        if len(data) > 20 * 1024 * 1024:
+            self.send_html(500, page("Error", "<div class='err'>File too large.</div>"))
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(data)
+
     # -- routing
     def do_GET(self):
         self._set_sid_cookie = None
+        # hosted project? route by Host header before anything else
+        htoken = hosting_token_for_host(self.headers.get("Host", ""))
+        if htoken:
+            self.serve_hosted(htoken)
+            return
         sid, csrf = get_session(self)
         path = urllib.parse.urlparse(self.path).path
         if path == "/":
             done = qone("SELECT COUNT(*) FROM jobs WHERE status='done'")[0]
             self.send_html(200, home_page(sid, csrf, stats_done=done))
+            return
+        if path == "/hosting":
+            self.send_html(200, hosting_list_page(sid, csrf))
+            return
+        m = re.fullmatch(r"/hosting/([A-Za-z0-9_-]+)", path)
+        if m and HOSTING_TOKEN_RE.fullmatch(m.group(1)):
+            proj = get_hosting(m.group(1))
+            if not proj:
+                self.send_html(404, page("404", "<h1>Not found</h1>"))
+                return
+            self.send_html(200, hosting_detail_page(sid, csrf, proj))
             return
         m = re.fullmatch(r"/job/([A-Za-z0-9_-]+)", path)
         if m and TOKEN_RE.fullmatch(m.group(1)):
@@ -617,8 +1158,34 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         self._set_sid_cookie = None
+        # hosted projects are static: no POST handling on their hosts
+        if hosting_token_for_host(self.headers.get("Host", "")):
+            self.send_html(404, page("404", "<h1>Not found</h1>"))
+            return
         sid, csrf = get_session(self)
         path = urllib.parse.urlparse(self.path).path
+        if path == "/hosting/create":
+            self.handle_hosting_create(sid, csrf)
+            return
+        m = re.fullmatch(r"/hosting/([A-Za-z0-9_-]+)/delete", path)
+        if m and HOSTING_TOKEN_RE.fullmatch(m.group(1)):
+            form = self.read_form()
+            if form is None:
+                self.send_html(413, page("Error", "<div class='err'>Body too large.</div>"))
+                return
+            if not self.check_csrf(form, csrf):
+                self.send_html(403, self.csrf_error_page())
+                return
+            delete_hosting_project(m.group(1))
+            self.redirect("/hosting")
+            return
+        if path == "/instant":
+            form = self.read_form()
+            if form is None:
+                self.send_html(413, page("Error", "<div class='err'>Body too large.</div>"))
+                return
+            self.handle_instant(sid, csrf, form)
+            return
         form = self.read_form()
         if form is None:
             self.send_html(413, page("Error", "<div class='err'>Body too large.</div>"))
@@ -648,14 +1215,91 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def get_job(self, token):
         row = qone(
             "SELECT token, filter, status, created_at, started_at, finished_at,"
-            " hostname, elapsed, error FROM jobs WHERE token=?",
+            " hostname, elapsed, error, kind FROM jobs WHERE token=?",
             (token,),
         )
         if not row:
             return None
         keys = ("token", "filter", "status", "created_at", "started_at",
-                "finished_at", "hostname", "elapsed", "error")
+                "finished_at", "hostname", "elapsed", "error", "kind")
         return dict(zip(keys, row))
+
+    def handle_instant(self, sid, csrf, form):
+        if not self.check_csrf(form, csrf):
+            self.send_html(403, self.csrf_error_page())
+            return
+        ip = client_ip(self)
+        day = qone(
+            "SELECT COUNT(*) FROM jobs WHERE ip=? AND created_at>?",
+            (ip, now() - 86400),
+        )[0]
+        if day >= MAX_JOBS_PER_IP_24H:
+            self.send_html(
+                429,
+                page("Daily limit",
+                     "<div class='card'><div class='err'>The %d-job per 24h limit "
+                     "for this IP has been reached.</div><p><a href='/'>Back</a></p></div>"
+                     % MAX_JOBS_PER_IP_24H),
+            )
+            return
+        try:
+            token = create_instant_job(ip)
+        except Exception as e:  # noqa: BLE001 - show error, never crash
+            self.send_html(
+                500,
+                page("Error",
+                     "<div class='card'><div class='err'>Generation failed: %s</div>"
+                     "<p><a href='/'>Back</a></p></div>" % esc(e)))
+            return
+        self.redirect("/job/" + token)
+
+    def handle_hosting_create(self, sid, csrf):
+        parsed = self.parse_multipart(MAX_UPLOAD)
+        if parsed is None:
+            self.send_html(
+                400, hosting_list_page(
+                    sid, csrf,
+                    error="Upload failed: bad request or file larger than 10 MB."))
+            return
+        fields, files = parsed
+        csrf_tok = fields.get("csrf_token", "")
+        if not (csrf_tok and secrets.compare_digest(csrf_tok, csrf)):
+            self.send_html(403, self.csrf_error_page())
+            return
+        name = (fields.get("name") or "").strip()[:60]
+        up = files.get("sitezip")
+        if not name:
+            self.send_html(
+                400, hosting_list_page(sid, csrf, error="Project name is required."))
+            return
+        if not up or not up["data"]:
+            self.send_html(
+                400, hosting_list_page(sid, csrf, error="No zip file received."))
+            return
+        if not up["filename"].lower().endswith(".zip"):
+            self.send_html(
+                400, hosting_list_page(
+                    sid, csrf, error="Only .zip files are accepted."))
+            return
+        ip = client_ip(self)
+        n = qone("SELECT COUNT(*) FROM hosting WHERE ip=?", (ip,))[0]
+        if n >= MAX_HOSTING_PER_IP:
+            self.send_html(
+                429, hosting_list_page(
+                    sid, csrf,
+                    error="Project limit reached (%d per IP)." % MAX_HOSTING_PER_IP))
+            return
+        try:
+            token, _onion = create_hosting_project(name, up["data"], ip)
+        except ValueError as e:
+            self.send_html(400, hosting_list_page(sid, csrf, error=str(e)))
+            return
+        except Exception as e:  # noqa: BLE001 - show error, never crash
+            self.send_html(
+                500, hosting_list_page(
+                    sid, csrf, error="Hosting failed: %s" % e))
+            return
+        self.redirect("/hosting/" + token)
 
     def handle_request(self, sid, csrf, form):
         if not self.check_csrf(form, csrf):
@@ -749,8 +1393,17 @@ def recover_stale_jobs():
 def main():
     os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs(JOBS_DIR, exist_ok=True)
+    os.makedirs(HOSTING_DIR, exist_ok=True)
     db()  # init schema
     recover_stale_jobs()
+    refresh_host_map()
+    try:
+        if sync_hosting_tor():
+            print("hosting hidden services synced, tor reloaded")
+        else:
+            print("hosting hidden services in sync")
+    except Exception as e:  # noqa: BLE001 - never crash startup on this
+        print("hosting sync failed: %s" % e)
     if not (os.path.isfile(MKP224O_BIN) and os.access(MKP224O_BIN, os.X_OK)):
         print("WARNING: mkp224o binary not found/executable: %s" % MKP224O_BIN)
     t = threading.Thread(target=worker_loop, daemon=True)

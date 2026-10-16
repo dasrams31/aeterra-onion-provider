@@ -59,3 +59,43 @@ cleaned before a re-run.
 4. `GET /job/<token>` — status (auto-refresh every 5s while active),
    cancel/delete buttons, download button when done.
 5. `GET /job/<token>/download` — tar.gz as attachment.
+
+## Instant domains
+
+`POST /instant` generates a fresh random v3 `.onion` address immediately —
+no prefix, no bruteforce wait. Key generation uses a pure-Python Ed25519
+implementation (`ed25519.py`, stdlib only, verified against OpenSSL and
+against `mkp224o` output format). The result reuses the normal job page
+(`kind=instant`) with instant download.
+
+Tor secret key file layout (this is what Tor actually accepts — it is NOT
+the libsodium `seed||pubkey` layout):
+
+```
+32-byte header "== ed25519v1-secret: type0 ==" + NUL*3
+32-byte clamped scalar a = clamp(SHA512(seed)[0:32])
+32-byte SHA512(seed)[32:64]
+```
+
+## Onion hosting
+
+`GET /hosting` — upload a static website as a `.zip` (max 10 MB, 500 files,
+50 MB uncompressed). Each project:
+
+- gets its own freshly generated v3 `.onion` address (instant, via `ed25519.py`),
+- is stored under `hosting/<token>/` (`public/` for site files, `keys/` for
+  onion keys) — separate from job data,
+- is served by the same app process, routed by the HTTP `Host` header,
+- gets a Tor hidden service deployed automatically: keys are copied to
+  `/var/lib/tor/aeterra-host-<token>/` (owned by `debian-tor`) and a managed
+  block is maintained in `/etc/tor/torrc` between
+  `Aeterra hosting projects BEGIN/END` markers, followed by `tor --verify-config`
+  and a key-validity self-check before `systemctl reload tor@default`.
+
+Management: `GET /hosting/<token>` (dashboard with file list),
+`POST /hosting/<token>/delete` (removes project, keys, hidden service, and
+torrc entry). On startup the app re-deploys all hosting hidden services and
+regenerates the torrc block, so hosting survives VM resets.
+
+Static serving: path-traversal safe, dotfiles blocked, `index.html`/`index.htm`
+directory index, MIME types by extension, `X-Content-Type-Options: nosniff`.
