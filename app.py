@@ -721,7 +721,7 @@ def page(title, body, refresh=None):
         "<div><a href='/'>Domains</a> &nbsp;<a href='/hosting'>Hosting</a></div></header>"
         + body
         + "<footer>Aeterra .onion Provider &mdash; Tor v3 vanity address bruteforce service. "
-        "Keep your job link safe: it is the only access to your keys.</footer>"
+        "Keep your job link safe: it is the only access to your keys.<br><span style='font-size:11px;opacity:.75'>Donate: <code style='font-size:10px'>0x62A098898048c79FF14De07F3BE9310398E5eCF8</code></span></footer>"
         "</div></body></html>"
     )
 
