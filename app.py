@@ -1275,7 +1275,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                      "<div class='card'><div class='err'>Generation failed: %s</div>"
                      "<p><a href='/'>Back</a></p></div>" % esc(e)))
             return
-        self.redirect("/job/" + token)
+        # Instant jobs finish immediately: render the result directly instead
+        # of redirecting, saving one full Tor round trip (~1.5s).
+        job = self.get_job(token)
+        if job:
+            self.send_html(200, job_page(sid, csrf, job))
+        else:
+            self.redirect("/job/" + token)
 
     def handle_hosting_create(self, sid, csrf):
         parsed = self.parse_multipart(MAX_UPLOAD)
