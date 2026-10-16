@@ -1,0 +1,7 @@
+data/
+jobs/
+tor-keys/
+__pycache__/
+*.db
+*.db-wal
+*.db-shm
