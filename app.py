@@ -955,16 +955,33 @@ fresh hidden service to become reachable.</p>
 
 class Handler(http.server.BaseHTTPRequestHandler):
     server_version = "Aeterra/1.0"
+    protocol_version = "HTTP/1.1"  # keep-alive: reuses one Tor circuit connection
 
     def log_message(self, fmt, *args):  # quieter logs
         pass
 
     # -- response helpers
+    def _maybe_gzip(self, data, ctype):
+        """Gzip-compress text responses when the client accepts it."""
+        if not ctype.startswith("text/") and "javascript" not in ctype \
+                and "json" not in ctype and "svg" not in ctype:
+            return data, None
+        if "gzip" not in self.headers.get("Accept-Encoding", ""):
+            return data, None
+        if len(data) < 512:
+            return data, None
+        import gzip as _gzip
+        return _gzip.compress(data, compresslevel=6), "gzip"
+
     def send_html(self, code, html_body, extra_headers=()):
         data = html_body.encode("utf-8")
+        data, encoding = self._maybe_gzip(data, "text/html; charset=utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
+        if encoding:
+            self.send_header("Content-Encoding", encoding)
+            self.send_header("Vary", "Accept-Encoding")
         if getattr(self, "_set_sid_cookie", None):
             self.send_header(
                 "Set-Cookie",
@@ -1106,10 +1123,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if len(data) > 20 * 1024 * 1024:
             self.send_html(500, page("Error", "<div class='err'>File too large.</div>"))
             return
+        data, encoding = self._maybe_gzip(data, ctype)
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("X-Content-Type-Options", "nosniff")
+        # hosted files are content-addressed by project; cache for an hour
+        # (project delete/replace changes the onion address anyway)
+        self.send_header("Cache-Control", "public, max-age=3600")
+        if encoding:
+            self.send_header("Content-Encoding", encoding)
+            self.send_header("Vary", "Accept-Encoding")
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(data)
